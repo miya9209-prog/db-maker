@@ -2,592 +2,641 @@ import os
 import re
 import json
 import time
+import html
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import pandas as pd
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from openai import OpenAI
 
-st.set_page_config(page_title="MISHARP 상품 DB 생성기", layout="wide")
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
-SCHEMA_COLUMNS = [
-    "product_no",
-    "product_name",
-    "category",
-    "sub_category",
-    "price",
-    "fabric",
-    "fit_type",
-    "size_range",
-    "recommended_body_type",
-    "body_cover_features",
-    "style_tags",
-    "season",
-    "length_type",
-    "sleeve_type",
-    "color_options",
-    "recommended_age",
-    "coordination_items",
-    "product_summary",
-    "product_url",
+st.set_page_config(page_title="미샵 DB 생성기", layout="wide")
+
+BASE_URL = "https://www.misharp.co.kr"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+DEFAULT_COLUMNS = [
+    "product_no", "product_name", "category", "sub_category", "price", "fabric",
+    "fit_type", "size_range", "recommended_body_type", "body_cover_features", "style_tags",
+    "season", "length_type", "sleeve_type", "color_options", "recommended_age",
+    "coordination_items", "product_summary", "product_url"
 ]
 
-DEFAULT_ROW = {
-    "product_no": "",
-    "product_name": "",
-    "category": "",
-    "sub_category": "",
-    "price": "",
-    "fabric": "",
-    "fit_type": "",
-    "size_range": "",
-    "recommended_body_type": "4050 여성 일반체형",
-    "body_cover_features": "",
-    "style_tags": "데일리",
-    "season": "간절기",
-    "length_type": "기본",
-    "sleeve_type": "긴팔",
-    "color_options": "",
-    "recommended_age": "4050",
-    "coordination_items": "슬랙스;데님;스커트",
-    "product_summary": "",
-    "product_url": "",
-}
-
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-    )
-}
 
-SYSTEM_PROMPT = """
-너는 MISHARP 여성의류 쇼핑몰의 상품 DB 정규화 담당자다.
-주어진 상품 페이지 원문에서 구조화된 CSV용 속성을 추출한다.
-
-규칙:
-- 반드시 JSON 객체 1개만 출력한다.
-- 빈칸은 최소화하되, 근거가 부족하면 보수적으로 추론한다.
-- 언어는 한국어.
-- style_tags, recommended_body_type, body_cover_features, coordination_items, color_options는 세미콜론(;) 구분 문자열로 만든다.
-- fit_type은 정핏/세미루즈/루즈핏/슬림핏/오버핏 중 가장 가까운 값.
-- season은 봄/여름/가을/겨울/간절기 또는 세미콜론 조합.
-- length_type은 크롭/기본/하프/롱 중 선택.
-- sleeve_type은 긴팔/반팔/민소매/드롭숄더/퍼프소매 중 가장 가까운 값.
-- recommended_age는 기본 4050.
-- product_summary는 80자 이내로 핵심만 요약.
-- product_no와 product_url은 입력값을 유지한다.
-""".strip()
+def get_client():
+    if OPENAI_API_KEY and OpenAI is not None:
+        return OpenAI(api_key=OPENAI_API_KEY)
+    return None
 
 
 def clean_text(text: str) -> str:
-    text = re.sub(r"\s+", " ", str(text or "")).strip()
-    return text
+    if text is None:
+        return ""
+    text = html.unescape(str(text))
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def parse_product_no(url: str) -> str:
+def to_abs_url(url: str) -> str:
     if not url:
         return ""
-    parsed = urlparse(url)
-    qs = parse_qs(parsed.query)
-    if "product_no" in qs and qs["product_no"]:
-        return qs["product_no"][0]
-    m = re.search(r"/(\d{3,})/(?:category|display|$)", parsed.path)
-    if m:
-        return m.group(1)
-    m = re.search(r"product_no=(\d+)", url)
-    return m.group(1) if m else ""
+    return urljoin(BASE_URL, url)
 
 
-def normalize_url(url: str) -> str:
-    url = clean_text(url)
-    if not url:
-        return ""
-    if url.startswith("//"):
-        url = "https:" + url
-    if not url.startswith("http"):
-        url = "https://" + url.lstrip("/")
+def normalize_product_url(url: str) -> str:
+    url = to_abs_url(url)
+    pno = extract_product_no(url)
+    if pno:
+        return f"{BASE_URL}/product/detail.html?product_no={pno}"
     return url
 
 
+def extract_product_no(url: str) -> str:
+    if not url:
+        return ""
+    m = re.search(r"product_no=(\d+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"/product/.+/(\d+)(?:/category|/display|/)?", url)
+    if m:
+        return m.group(1)
+    return ""
+
+
+def extract_cate_no(url: str) -> str:
+    if not url:
+        return ""
+    m = re.search(r"cate_no=(\d+)", url)
+    if m:
+        return m.group(1)
+    return ""
+
+
 def is_product_url(url: str) -> bool:
-    low = (url or "").lower()
-    return "/product/" in low or "product_no=" in low
+    url = (url or "").lower()
+    return ("product_no=" in url) or ("/product/detail.html" in url) or bool(re.search(r"/product/.+?/\d+", url))
 
 
 def is_category_url(url: str) -> bool:
-    low = (url or "").lower()
-    return "/category/" in low and not is_product_url(url)
+    url = (url or "").lower()
+    if is_product_url(url):
+        return False
+    return ("/product/list.html" in url and "cate_no=" in url) or ("/category/" in url)
 
 
 def fetch_html(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=25)
+    headers = {"User-Agent": USER_AGENT, "Referer": BASE_URL}
+    r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
     return r.text
 
 
-def soup_from_url(url: str) -> BeautifulSoup:
-    return BeautifulSoup(fetch_html(url), "html.parser")
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_html_cached(url: str) -> str:
+    return fetch_html(url)
 
 
-def get_text_blocks(soup: BeautifulSoup) -> str:
-    clone = BeautifulSoup(str(soup), "html.parser")
-    for tag in clone(["script", "style", "noscript", "svg", "iframe"]):
-        tag.decompose()
-    text = clone.get_text("\n")
-    text = re.sub(r"\n{2,}", "\n", text)
-    lines = [clean_text(x) for x in text.splitlines()]
-    lines = [x for x in lines if x]
-    return "\n".join(lines)
+def gather_product_urls_from_html(category_url: str, html_text: str) -> list[str]:
+    urls = []
+    soup = BeautifulSoup(html_text, "html.parser")
 
-
-def extract_product_name(soup: BeautifulSoup) -> str:
-    selectors = [
-        "#span_product_name",
-        ".infoArea #span_product_name",
-        ".headingArea h2",
-        ".headingArea h3",
-        "meta[property='og:title']",
-        "title",
-    ]
-    for sel in selectors:
-        el = soup.select_one(sel)
-        if not el:
-            continue
-        if el.name == "meta":
-            value = clean_text(el.get("content", ""))
-        else:
-            value = clean_text(el.get_text(" ", strip=True))
-        value = re.sub(r"\s*\|.*$", "", value)
-        value = re.sub(r"\s*-\s*미샵.*$", "", value, flags=re.I)
-        value = re.sub(r"\s*-\s*MISHARP.*$", "", value, flags=re.I)
-        if value and value.lower() not in {"misharp", "미샵"}:
-            return value
-    return ""
-
-
-def extract_price(text: str) -> str:
-    patterns = [
-        r"할인판매가\s*[:：]?\s*([0-9,]+)원",
-        r"판매가\s*[:：]?\s*([0-9,]+)원",
-        r"price\s*[:：]?\s*([0-9,]+)원",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.I)
-        if m:
-            return m.group(1).replace(",", "")
-    return ""
-
-
-def extract_fabric(text: str) -> str:
-    candidates = []
-    for pat in [
-        r"소재\s*[:：]\s*([^\n]{1,180})",
-        r"fabric\s*[:：]\s*([^\n]{1,180})",
-    ]:
-        for m in re.finditer(pat, text, re.I):
-            val = clean_text(m.group(1))
-            if 2 <= len(val) <= 150:
-                candidates.append(val)
-    for val in candidates:
-        if any(k in val for k in ["면", "폴리", "울", "나일론", "레이온", "텐셀", "스판", "아크릴", "모달", "%"]):
-            return val
-    return candidates[0] if candidates else ""
-
-
-def extract_size_range(text: str) -> str:
-    patterns = [
-        r"free사이즈로\s*([0-9가-힣~\-]+)까지\s*추천",
-        r"사이즈\s*TIP\s*([^\n]{1,120})",
-        r"사이즈\s*[:：]\s*([^\n]{1,120})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, text, re.I)
-        if m:
-            val = clean_text(m.group(1))
-            if "추천" in val and len(val) < 40:
-                return val
-            if any(k in val for k in ["55", "66", "77", "88", "FREE", "free", "S", "M", "L", "XL"]):
-                return val
-    hits = []
-    for token in ["44", "55", "55반", "66", "66반", "77", "77반", "88", "FREE", "S", "M", "L", "XL"]:
-        if re.search(rf"\b{re.escape(token)}\b", text):
-            hits.append(token)
-    hits = list(dict.fromkeys(hits))
-    if hits:
-        return "-".join(hits[:4])
-    return ""
-
-
-def extract_colors(text: str) -> str:
-    m = re.search(r"모델\s*착용\s*[:：]?\s*([^\n]{1,100})", text)
-    if m:
-        raw = clean_text(m.group(1))
-        raw = raw.replace(",", ";")
-        return raw
-    colors = [
-        "아이보리", "크림", "베이지", "모카", "브라운", "카멜", "그레이", "차콜", "블랙",
-        "화이트", "네이비", "블루", "소라", "민트", "카키", "핑크", "라벤더", "와인",
-    ]
-    found = [c for c in colors if c in text]
-    found = list(dict.fromkeys(found))
-    return ";".join(found[:6])
-
-
-def infer_basic_fields(product_name: str, text: str, url: str) -> dict:
-    low_name = f"{product_name} {text[:2500]}"
-    category = ""
-    sub_category = ""
-    if any(k in low_name for k in ["자켓", "점퍼", "코트", "패딩", "가디건", "아우터", "블루종"]):
-        category = "아우터"
-        if "자켓" in low_name:
-            sub_category = "자켓"
-        elif "코트" in low_name:
-            sub_category = "코트"
-        elif "가디건" in low_name:
-            sub_category = "가디건"
-        elif "점퍼" in low_name or "블루종" in low_name:
-            sub_category = "점퍼"
-    elif any(k in low_name for k in ["니트", "맨투맨", "티셔츠", "블라우스", "셔츠"]):
-        category = "상의"
-        if "니트" in low_name:
-            sub_category = "니트"
-        elif "블라우스" in low_name:
-            sub_category = "블라우스"
-        elif "셔츠" in low_name:
-            sub_category = "셔츠"
-        elif "맨투맨" in low_name:
-            sub_category = "맨투맨"
-        else:
-            sub_category = "티셔츠"
-    elif any(k in low_name for k in ["슬랙스", "팬츠", "데님", "진", "청바지", "스커트"]):
-        category = "하의"
-        if "스커트" in low_name:
-            sub_category = "스커트"
-        elif any(k in low_name for k in ["데님", "진", "청바지"]):
-            sub_category = "데님"
-        else:
-            sub_category = "팬츠"
-    elif any(k in low_name for k in ["원피스", "드레스"]):
-        category = "원피스"
-        sub_category = "원피스"
-
-    fit_type = "정핏"
-    if any(k in low_name for k in ["루즈핏", "루즈", "오버핏"]):
-        fit_type = "루즈핏" if "루즈" in low_name else "오버핏"
-    elif any(k in low_name for k in ["슬림", "슬리밍"]):
-        fit_type = "슬림핏"
-    elif any(k in low_name for k in ["세미루즈", "적당히 여유", "레귤러"]):
-        fit_type = "세미루즈"
-
-    season = []
-    for token in ["봄", "여름", "가을", "겨울", "간절기"]:
-        if token in low_name:
-            season.append(token)
-    if not season:
-        season = ["간절기"]
-
-    style_tags = []
-    mapping = {
-        "클래식": ["클래식", "단정", "테일러드"],
-        "페미닌": ["여성스러운", "페미닌", "우아"],
-        "데일리": ["데일리", "일상"],
-        "오피스룩": ["오피스", "출근"],
-        "학모룩": ["학모룩", "학교상담", "학교"],
-        "모임룩": ["모임", "하객", "격식"],
-    }
-    for tag, keys in mapping.items():
-        if any(k in low_name for k in keys):
-            style_tags.append(tag)
-    if not style_tags:
-        style_tags = ["데일리"]
-
-    body_cover = []
-    for label, keys in {
-        "팔뚝커버": ["팔뚝", "소매"],
-        "뱃살커버": ["복부", "배", "뱃살"],
-        "힙커버": ["힙", "엉덩이"],
-        "허리라인보정": ["허리라인", "라인", "A라인"],
-    }.items():
-        if any(k in low_name for k in keys):
-            body_cover.append(label)
-
-    coord = []
-    for item in ["슬랙스", "데님", "스커트", "원피스", "니트"]:
-        if item in low_name:
-            coord.append(item)
-    if not coord:
-        coord = ["슬랙스", "데님", "스커트"]
-
-    length_type = "기본"
-    if any(k in low_name for k in ["크롭"]):
-        length_type = "크롭"
-    elif any(k in low_name for k in ["하프"]):
-        length_type = "하프"
-    elif any(k in low_name for k in ["롱"]):
-        length_type = "롱"
-
-    sleeve_type = "긴팔"
-    if "반팔" in low_name:
-        sleeve_type = "반팔"
-    elif "민소매" in low_name:
-        sleeve_type = "민소매"
-    elif "퍼프" in low_name:
-        sleeve_type = "퍼프소매"
-    elif "드롭숄더" in low_name:
-        sleeve_type = "드롭숄더"
-
-    return {
-        "category": category,
-        "sub_category": sub_category,
-        "fit_type": fit_type,
-        "season": ";".join(dict.fromkeys(season)),
-        "style_tags": ";".join(dict.fromkeys(style_tags)),
-        "body_cover_features": ";".join(dict.fromkeys(body_cover)),
-        "coordination_items": ";".join(dict.fromkeys(coord)),
-        "length_type": length_type,
-        "sleeve_type": sleeve_type,
-    }
-
-
-def extract_product_urls_from_category(category_url: str, max_products: int = 0) -> list[str]:
-    soup = soup_from_url(category_url)
-    candidates = []
+    # 1) 가장 일반적인 a[href] 수집
     for a in soup.select("a[href]"):
-        href = a.get("href", "")
+        href = clean_text(a.get("href", ""))
         if not href:
             continue
-        full = urljoin(category_url, href)
-        if is_product_url(full):
-            candidates.append(full)
-    normalized = []
+        abs_url = to_abs_url(href)
+        pno = extract_product_no(abs_url)
+        if pno:
+            urls.append(normalize_product_url(abs_url))
+
+    # 2) HTML 원문에서 직접 추출
+    for m in re.finditer(r"(?:href=|location\.href=|product_no=|/product/)([^\"'<>\s]+)", html_text, flags=re.I):
+        raw = m.group(0)
+        pno = extract_product_no(raw)
+        if pno:
+            urls.append(f"{BASE_URL}/product/detail.html?product_no={pno}")
+
+    # 3) product_no 만 뽑히는 경우 대비
+    for pno in re.findall(r"product_no\s*[=:]\s*['\"]?(\d+)", html_text, flags=re.I):
+        urls.append(f"{BASE_URL}/product/detail.html?product_no={pno}")
+
+    # 4) category url 자체가 하나의 상품으로 잘못 들어오는 상황 제거
+    filtered = []
+    cate_no = extract_cate_no(category_url)
+    for u in urls:
+        if is_category_url(u) and not extract_product_no(u):
+            continue
+        filtered.append(u)
+
+    # 순서 유지 중복 제거
     seen = set()
-    for url in candidates:
-        pn = parse_product_no(url)
-        if not pn:
+    out = []
+    for u in filtered:
+        pno = extract_product_no(u)
+        if not pno:
             continue
-        if pn in seen:
+        key = pno
+        if key in seen:
             continue
-        seen.add(pn)
-        normalized.append(url)
-    if max_products and max_products > 0:
-        normalized = normalized[:max_products]
-    return normalized
+        seen.add(key)
+        out.append(f"{BASE_URL}/product/detail.html?product_no={pno}")
+    return out
 
 
-def build_product_payload(product_url: str) -> dict:
-    soup = soup_from_url(product_url)
-    page_text = get_text_blocks(soup)
-    product_name = extract_product_name(soup)
-    product_no = parse_product_no(product_url)
-    heuristics = infer_basic_fields(product_name, page_text, product_url)
-    payload = {
-        "product_no": product_no,
-        "product_name": product_name,
-        "price": extract_price(page_text),
-        "fabric": extract_fabric(page_text),
-        "size_range": extract_size_range(page_text),
-        "color_options": extract_colors(page_text),
-        "product_url": product_url,
-        **heuristics,
-        "page_text": page_text[:14000],
+def find_pagination_urls(category_url: str, html_text: str, max_pages: int = 20) -> list[str]:
+    page_urls = [category_url]
+    cate_no = extract_cate_no(category_url)
+    if not cate_no:
+        return page_urls
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    candidates = []
+    for a in soup.select("a[href]"):
+        href = clean_text(a.get("href", ""))
+        if not href:
+            continue
+        abs_url = to_abs_url(href)
+        if extract_cate_no(abs_url) == cate_no and abs_url not in candidates:
+            candidates.append(abs_url)
+
+    numbered = []
+    for u in candidates:
+        q = parse_qs(urlparse(u).query)
+        if "page" in q:
+            try:
+                numbered.append(int(q["page"][0]))
+            except Exception:
+                pass
+
+    max_found = max(numbered) if numbered else 1
+    max_found = min(max_found, max_pages)
+
+    # 기본 페이지 규칙 추가
+    for page in range(2, max_found + 1):
+        sep = "&" if "?" in category_url else "?"
+        page_urls.append(f"{category_url}{sep}page={page}")
+
+    # 혹시 pagination anchor가 못 잡혀도 최소한 앞 몇 페이지까지 확인 가능하도록 후보 추가
+    if len(page_urls) == 1:
+        for page in range(2, min(max_pages, 10) + 1):
+            sep = "&" if "?" in category_url else "?"
+            page_urls.append(f"{category_url}{sep}page={page}")
+
+    # 중복 제거
+    dedup = []
+    seen = set()
+    for u in page_urls:
+        if u not in seen:
+            seen.add(u)
+            dedup.append(u)
+    return dedup
+
+
+def collect_product_urls_from_category(category_url: str, max_products: int = 300, delay_sec: float = 0.2) -> list[str]:
+    first_html = fetch_html_cached(category_url)
+    page_urls = find_pagination_urls(category_url, first_html)
+
+    all_urls = []
+    seen = set()
+
+    for idx, page_url in enumerate(page_urls, start=1):
+        try:
+            html_text = first_html if idx == 1 else fetch_html(page_url)
+        except Exception:
+            continue
+
+        product_urls = gather_product_urls_from_html(category_url, html_text)
+        newly_added = 0
+        for u in product_urls:
+            pno = extract_product_no(u)
+            if not pno or pno in seen:
+                continue
+            seen.add(pno)
+            all_urls.append(u)
+            newly_added += 1
+            if len(all_urls) >= max_products:
+                return all_urls
+
+        # 새로 추가된 상품이 아예 없으면 뒤 페이지는 그만
+        if idx > 1 and newly_added == 0:
+            break
+
+        if delay_sec > 0:
+            time.sleep(delay_sec)
+
+    return all_urls
+
+
+def parse_price(text: str) -> str:
+    text = clean_text(text)
+    m = re.search(r"([0-9][0-9,]{2,})\s*원", text)
+    if m:
+        return m.group(1).replace(",", "")
+    m = re.search(r"([0-9][0-9,]{2,})", text)
+    if m:
+        return m.group(1).replace(",", "")
+    return ""
+
+
+def normalize_name(name: str) -> str:
+    name = clean_text(name)
+    name = re.sub(r"\s*\([^)]*color[^)]*\)", "", name, flags=re.I)
+    return clean_text(name)
+
+
+def infer_category_from_name(name: str) -> tuple[str, str]:
+    name_l = (name or "").lower()
+    pairs = [
+        ("아우터", "자켓", ["자켓", "재킷", "jk"]),
+        ("아우터", "점퍼", ["점퍼", "후드", "사파리"]),
+        ("아우터", "코트", ["코트"]),
+        ("니트/가디건", "니트", ["니트"]),
+        ("니트/가디건", "가디건", ["가디건"]),
+        ("팬츠", "슬랙스", ["슬랙스"]),
+        ("팬츠", "데님", ["데님", "청바지", "진"]),
+        ("팬츠", "팬츠", ["팬츠", "바지"]),
+        ("블라우스/셔츠", "블라우스", ["블라우스"]),
+        ("블라우스/셔츠", "셔츠", ["셔츠"]),
+        ("티셔츠", "티셔츠", ["티셔츠", "맨투맨", "mtm"]),
+        ("원피스/스커트", "원피스", ["원피스"]),
+        ("원피스/스커트", "스커트", ["스커트"]),
+    ]
+    for cat, sub, kws in pairs:
+        if any(kw in name_l for kw in kws):
+            return cat, sub
+    return "", ""
+
+
+def infer_fabric(text: str) -> str:
+    t = clean_text(text)
+    patterns = [
+        r"(면\s*\d+%[^\n,.]*)", r"(코튼\s*\d+%[^\n,.]*)", r"(폴리(?:에스터)?\s*\d+%[^\n,.]*)",
+        r"(레이온\s*\d+%[^\n,.]*)", r"(울\s*\d+%[^\n,.]*)", r"(비스코스\s*\d+%[^\n,.]*)",
+        r"(나일론\s*\d+%[^\n,.]*)", r"(스판(?:덱스)?\s*\d+%[^\n,.]*)",
+    ]
+    found = []
+    for p in patterns:
+        for m in re.findall(p, t, flags=re.I):
+            cm = clean_text(m)
+            if cm not in found:
+                found.append(cm)
+    if found:
+        return " / ".join(found[:4])
+    return ""
+
+
+def infer_size_range(text: str) -> str:
+    t = clean_text(text)
+    tokens = []
+    for token in ["44", "55", "55반", "66", "66반", "77", "77반", "88", "FREE", "F"]:
+        if token in t and token not in tokens:
+            tokens.append(token)
+    if "FREE" in tokens or "F" in tokens:
+        return "FREE"
+    if not tokens:
+        m = re.search(r"(\d{2}\s*~\s*\d{2})", t)
+        if m:
+            return clean_text(m.group(1)).replace(" ~ ", "-")
+        return ""
+    return "-".join(tokens[:2]) if len(tokens) >= 2 else tokens[0]
+
+
+def infer_fit_type(text: str) -> str:
+    t = clean_text(text)
+    rules = [
+        ("오버핏", ["오버핏"]),
+        ("루즈핏", ["루즈핏"]),
+        ("세미루즈", ["세미루즈", "여유 있는 핏", "살짝 여유"]),
+        ("슬림핏", ["슬림핏", "라인감", "슬림하게"]),
+        ("정핏", ["정핏", "기본핏", "스탠다드핏"]),
+    ]
+    for label, kws in rules:
+        if any(k in t for k in kws):
+            return label
+    return ""
+
+
+def infer_tags(text: str, name: str) -> dict:
+    t = f"{clean_text(name)} {clean_text(text)}"
+    style = []
+    body = []
+    coord = []
+
+    style_rules = {
+        "클래식": ["클래식", "단정", "고급스러운"],
+        "페미닌": ["페미닌", "여성스러운", "우아한"],
+        "데일리": ["데일리", "매일", "기본템"],
+        "오피스룩": ["오피스", "출근룩", "직장"],
+        "학모룩": ["학모", "학교", "상담룩"],
+        "모임룩": ["모임", "하객", "격식"],
     }
-    return payload
+    for tag, kws in style_rules.items():
+        if any(k in t for k in kws):
+            style.append(tag)
+
+    body_rules = {
+        "팔뚝커버": ["팔뚝", "레글런", "드롭숄더"],
+        "뱃살커버": ["복부", "뱃살", "허리선 정리"],
+        "힙커버": ["힙", "엉덩이", "롱기장"],
+        "허리라인보정": ["허리라인", "라인감", "A라인"],
+    }
+    for tag, kws in body_rules.items():
+        if any(k in t for k in kws):
+            body.append(tag)
+
+    coord_rules = {
+        "슬랙스": ["슬랙스"],
+        "데님": ["데님", "청바지"],
+        "스커트": ["스커트"],
+        "원피스": ["원피스"],
+        "니트": ["니트"],
+    }
+    for tag, kws in coord_rules.items():
+        if any(k in t for k in kws):
+            coord.append(tag)
+
+    return {
+        "style_tags": ";".join(style[:4]),
+        "body_cover_features": ";".join(body[:4]),
+        "coordination_items": ";".join(coord[:4]),
+    }
 
 
-def merge_row(base: dict, incoming: dict) -> dict:
-    row = dict(DEFAULT_ROW)
-    row.update(base)
-    for key in SCHEMA_COLUMNS:
-        val = incoming.get(key, None)
-        if val is None:
-            continue
-        sval = clean_text(val)
-        if sval:
-            row[key] = sval
+def infer_season(text: str, name: str) -> str:
+    t = f"{clean_text(name)} {clean_text(text)}"
+    seasons = []
+    if any(k in t for k in ["봄", "간절기", "스프링"]):
+        seasons.append("봄")
+    if any(k in t for k in ["여름", "썸머", "반팔"]):
+        seasons.append("여름")
+    if any(k in t for k in ["가을", "간절기"]):
+        seasons.append("가을")
+    if any(k in t for k in ["겨울", "울", "기모"]):
+        seasons.append("겨울")
+    if not seasons and any(k in t for k in ["간절기"]):
+        seasons.append("간절기")
+    return ";".join(dict.fromkeys(seasons))
+
+
+def infer_length_type(name: str, text: str) -> str:
+    t = f"{name} {text}"
+    if any(k in t for k in ["크롭"]):
+        return "크롭"
+    if any(k in t for k in ["롱", "롱기장"]):
+        return "롱"
+    if any(k in t for k in ["하프"]):
+        return "하프"
+    return "기본"
+
+
+def infer_sleeve_type(name: str, text: str) -> str:
+    t = f"{name} {text}"
+    if "반팔" in t:
+        return "반팔"
+    if "퍼프" in t:
+        return "퍼프소매"
+    if "드롭숄더" in t:
+        return "드롭숄더"
+    return "긴팔"
+
+
+def infer_colors(text: str) -> str:
+    t = clean_text(text)
+    colors = []
+    for c in ["블랙", "아이보리", "화이트", "베이지", "그레이", "네이비", "카키", "브라운", "핑크", "소라", "블루"]:
+        if c in t and c not in colors:
+            colors.append(c)
+    if not colors:
+        m = re.search(r"\((\d+)\s*color\)", t, flags=re.I)
+        if m:
+            return f"{m.group(1)}컬러"
+    return ";".join(colors[:6])
+
+
+def make_summary(name: str, text: str) -> str:
+    t = clean_text(text)
+    if not t:
+        return name
+    sentences = re.split(r"[.!?]|\n", t)
+    picked = []
+    for s in sentences:
+        s = clean_text(s)
+        if len(s) >= 10:
+            picked.append(s)
+        if len(" ".join(picked)) >= 90:
+            break
+    return clean_text(" ".join(picked))[:140]
+
+
+def parse_product_page(url: str) -> dict:
+    html_text = fetch_html(url)
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    name = ""
+    for selector in ["#span_product_name", ".headingArea h2", ".headingArea h3", "title"]:
+        el = soup.select_one(selector)
+        if el:
+            name = normalize_name(el.get_text(" ", strip=True))
+            if name:
+                break
+
+    if not name:
+        for m in re.finditer(r"상품명\s*:?\s*([^\n<]+)", soup.get_text("\n"), flags=re.I):
+            cand = normalize_name(m.group(1))
+            if cand:
+                name = cand
+                break
+
+    body_text = clean_text(soup.get_text("\n", strip=True))
+    pno = extract_product_no(url)
+    cat, sub = infer_category_from_name(name)
+
+    price = ""
+    for label in ["할인판매가", "판매가"]:
+        m = re.search(label + r"\s*:?\s*([0-9][0-9,]{2,}\s*원)", body_text)
+        if m:
+            price = parse_price(m.group(1))
+            break
+
+    tags = infer_tags(body_text, name)
+    row = {
+        "product_no": pno,
+        "product_name": name,
+        "category": cat,
+        "sub_category": sub,
+        "price": price,
+        "fabric": infer_fabric(body_text),
+        "fit_type": infer_fit_type(body_text),
+        "size_range": infer_size_range(body_text),
+        "recommended_body_type": "4050 여성 일반체형",
+        "body_cover_features": tags["body_cover_features"],
+        "style_tags": tags["style_tags"],
+        "season": infer_season(body_text, name),
+        "length_type": infer_length_type(name, body_text),
+        "sleeve_type": infer_sleeve_type(name, body_text),
+        "color_options": infer_colors(body_text),
+        "recommended_age": "4050",
+        "coordination_items": tags["coordination_items"],
+        "product_summary": make_summary(name, body_text),
+        "product_url": normalize_product_url(url),
+    }
     return row
 
 
-def ai_normalize(payload: dict) -> dict:
+def refine_with_openai(row: dict) -> dict:
+    client = get_client()
     if client is None:
-        raise RuntimeError("OPENAI_API_KEY가 없어 AI 정규화를 사용할 수 없습니다.")
+        return row
 
-    user_prompt = f"""
-입력 메타데이터:
-{json.dumps({k: v for k, v in payload.items() if k != 'page_text'}, ensure_ascii=False, indent=2)}
+    prompt = f"""
+아래 상품 DB 초안을 미야언니용 상품 DB 규격으로 정리해줘.
+빈 값은 문맥상 합리적으로 보완하되 과장하지 말고, 반드시 JSON만 반환해.
+세미콜론(;)으로 다중값을 표기해.
 
-상품 원문:
-{payload['page_text']}
+필드:
+{', '.join(DEFAULT_COLUMNS)}
 
-반드시 아래 키만 가진 JSON 객체 1개로 답해:
-{json.dumps(DEFAULT_ROW, ensure_ascii=False, indent=2)}
-""".strip()
-
-    response = client.chat.completions.create(
-        model="gpt-5-mini",
-        temperature=0.2,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    raw = response.choices[0].message.content
-    data = json.loads(raw)
-    return merge_row({k: v for k, v in payload.items() if k in SCHEMA_COLUMNS}, data)
-
-
-def heuristic_only_row(payload: dict) -> dict:
-    summary = payload.get("page_text", "")
-    summary = re.sub(r"\s+", " ", summary)
-    summary = summary[:80]
-    base = {
-        k: v
-        for k, v in payload.items()
-        if k in SCHEMA_COLUMNS
-    }
-    if not base.get("product_summary"):
-        base["product_summary"] = summary
-    return merge_row(base, {})
+초안:
+{json.dumps(row, ensure_ascii=False)}
+"""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-5-mini",
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": "너는 여성 패션 상품 DB 정규화 전문가다. 반드시 JSON 객체만 반환한다."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        content = resp.choices[0].message.content.strip()
+        content = re.sub(r"^```json\s*|\s*```$", "", content, flags=re.S)
+        data = json.loads(content)
+        for col in DEFAULT_COLUMNS:
+            row[col] = clean_text(data.get(col, row.get(col, "")))
+        return row
+    except Exception:
+        return row
 
 
-def process_urls(urls: list[str], use_ai: bool, crawl_delay: float) -> pd.DataFrame:
-    rows = []
-    progress = st.progress(0.0)
-    status = st.empty()
-    total = max(len(urls), 1)
-
-    for idx, url in enumerate(urls, start=1):
-        status.info(f"처리 중 {idx}/{total} : {url}")
-        try:
-            payload = build_product_payload(url)
-            row = ai_normalize(payload) if use_ai else heuristic_only_row(payload)
-            rows.append(row)
-        except Exception as e:
-            error_row = dict(DEFAULT_ROW)
-            error_row["product_no"] = parse_product_no(url)
-            error_row["product_url"] = url
-            error_row["product_name"] = f"오류: {type(e).__name__}"
-            error_row["product_summary"] = clean_text(str(e))[:200]
-            rows.append(error_row)
-        progress.progress(idx / total)
-        if crawl_delay > 0:
-            time.sleep(crawl_delay)
-
-    progress.empty()
-    status.empty()
+def rows_to_csv_bytes(rows: list[dict]) -> bytes:
     df = pd.DataFrame(rows)
-    for col in SCHEMA_COLUMNS:
+    for col in DEFAULT_COLUMNS:
         if col not in df.columns:
             df[col] = ""
-    return df[SCHEMA_COLUMNS]
+    df = df[DEFAULT_COLUMNS]
+    return df.to_csv(index=False).encode("utf-8-sig")
 
 
-def expand_input_urls(raw_urls: list[str], max_products: int) -> list[str]:
-    out = []
-    for raw in raw_urls:
-        url = normalize_url(raw)
-        if not url:
-            continue
-        if is_category_url(url):
-            out.extend(extract_product_urls_from_category(url, max_products=max_products))
-        elif is_product_url(url):
-            out.append(url)
-    deduped = []
-    seen = set()
-    for url in out:
-        pn = parse_product_no(url) or url
-        if pn in seen:
-            continue
-        seen.add(pn)
-        deduped.append(url)
-    return deduped
-
-
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
-
-
-st.title("MISHARP 상품 DB 생성기")
-st.caption("상품별 URL 또는 카테고리 URL을 넣으면 미야언니용 CSV DB를 바로 생성합니다.")
+st.title("미샵 상품 DB CSV 생성기")
+st.caption("상품 URL 또는 카테고리 URL을 넣으면 미야언니용 DB CSV를 생성합니다.")
 
 with st.sidebar:
     st.subheader("설정")
-    use_ai = st.toggle("OpenAI로 속성 정규화", value=bool(client))
-    max_products = st.number_input("카테고리당 최대 상품 수", min_value=0, max_value=500, value=50, step=10)
-    crawl_delay = st.slider("요청 간 딜레이(초)", min_value=0.0, max_value=2.0, value=0.3, step=0.1)
-    st.markdown("- 0은 제한 없이 처리\n- AI 정규화 OFF면 휴리스틱만으로 빠르게 CSV 생성")
+    use_openai = st.toggle("OpenAI로 속성 정규화", value=False, disabled=not bool(get_client()))
+    if not get_client():
+        st.caption("OPENAI_API_KEY가 없으면 규칙기반 추출로 동작합니다.")
+    max_products = st.number_input("카테고리 최대 상품 수", min_value=1, max_value=1000, value=100, step=10)
+    delay_sec = st.slider("요청 간 딜레이(초)", 0.0, 2.0, 0.2, 0.1)
+    st.markdown("- 카테고리 URL이면 페이지를 순회하며 상품을 최대한 수집합니다.\n- 동일 상품은 product_no 기준으로 중복 제거합니다.\n- 결과 CSV는 UTF-8 BOM으로 저장됩니다.")
 
-sample_text = "\n".join([
-    "https://www.misharp.co.kr/product/detail.html?product_no=28522&cate_no=24&display_group=1",
-    "https://www.misharp.co.kr/category/%EC%95%84%EC%9A%B0%ED%84%B0/24/",
-])
-
-raw = st.text_area(
+urls_text = st.text_area(
     "상품 URL / 카테고리 URL 입력",
-    value="",
     height=180,
-    placeholder=sample_text,
+    placeholder="https://www.misharp.co.kr/product/detail.html?product_no=28522\nhttps://www.misharp.co.kr/product/list.html?cate_no=541",
 )
 
-col1, col2 = st.columns([1, 1])
+col1, col2 = st.columns([2, 1])
 with col1:
-    run = st.button("CSV 생성 시작", use_container_width=True, type="primary")
+    run_btn = st.button("CSV 생성 시작", use_container_width=True, type="primary")
 with col2:
-    preview_only = st.button("URL 확장 미리보기", use_container_width=True)
+    preview_btn = st.button("URL 확장 미리보기", use_container_width=True)
 
-input_urls = [clean_text(x) for x in raw.splitlines() if clean_text(x)]
+input_urls = [clean_text(x) for x in urls_text.splitlines() if clean_text(x)]
 
-if preview_only and input_urls:
-    try:
-        expanded = expand_input_urls(input_urls, max_products=max_products)
-        st.success(f"총 {len(expanded)}개 상품 URL을 찾았습니다.")
-        st.dataframe(pd.DataFrame({"product_url": expanded}), use_container_width=True)
-    except Exception as e:
-        st.error(f"미리보기 실패: {e}")
+if preview_btn and input_urls:
+    preview_rows = []
+    for u in input_urls:
+        if is_category_url(u):
+            try:
+                product_urls = collect_product_urls_from_category(u, max_products=min(30, int(max_products)), delay_sec=0)
+                preview_rows.append({"입력URL": u, "유형": "카테고리", "수집예상상품수": len(product_urls), "예시상품URL": product_urls[:5]})
+            except Exception as e:
+                preview_rows.append({"입력URL": u, "유형": "카테고리", "수집예상상품수": 0, "예시상품URL": [f"오류: {e}"]})
+        else:
+            preview_rows.append({"입력URL": u, "유형": "상품", "수집예상상품수": 1, "예시상품URL": [normalize_product_url(u)]})
+    st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
 
-if run:
+if run_btn:
     if not input_urls:
-        st.error("먼저 URL을 1개 이상 입력해 주세요.")
-        st.stop()
-    try:
-        urls = expand_input_urls(input_urls, max_products=max_products)
-    except Exception as e:
-        st.error(f"URL 확장 중 오류가 발생했습니다: {e}")
+        st.warning("URL을 1개 이상 입력해주세요.")
         st.stop()
 
-    if not urls:
-        st.error("처리 가능한 상품 URL을 찾지 못했습니다.")
-        st.stop()
+    expanded_urls = []
+    progress = st.progress(0.0)
+    status = st.empty()
 
-    st.info(f"총 {len(urls)}개 상품을 처리합니다.")
-    df = process_urls(urls, use_ai=use_ai, crawl_delay=float(crawl_delay))
+    for idx, u in enumerate(input_urls, start=1):
+        try:
+            if is_category_url(u):
+                urls = collect_product_urls_from_category(u, max_products=int(max_products), delay_sec=delay_sec)
+                if len(urls) <= 1:
+                    status.warning(f"카테고리 URL에서 상품이 1개 이하만 잡혔습니다. 수집 로직을 강하게 보완한 버전이지만, 사이트 구조 변경 시 추가 보완이 필요할 수 있습니다. URL: {u}")
+                expanded_urls.extend(urls)
+            else:
+                expanded_urls.append(normalize_product_url(u))
+        except Exception as e:
+            status.error(f"URL 확장 실패: {u} / {e}")
+        progress.progress(idx / max(len(input_urls), 1))
+
+    # 최종 중복 제거
+    dedup = []
+    seen = set()
+    for u in expanded_urls:
+        pno = extract_product_no(u) or u
+        if pno in seen:
+            continue
+        seen.add(pno)
+        dedup.append(u)
+    expanded_urls = dedup
+
+    st.info(f"총 {len(expanded_urls)}개 상품을 처리합니다.")
+
+    rows = []
+    progress = st.progress(0.0)
+    for i, u in enumerate(expanded_urls, start=1):
+        try:
+            row = parse_product_page(u)
+            if use_openai:
+                row = refine_with_openai(row)
+            rows.append(row)
+        except Exception as e:
+            rows.append({col: "" for col in DEFAULT_COLUMNS})
+            rows[-1]["product_no"] = extract_product_no(u)
+            rows[-1]["product_url"] = u
+            rows[-1]["product_summary"] = f"수집 실패: {e}"
+        progress.progress(i / max(len(expanded_urls), 1))
+
+    df = pd.DataFrame(rows)
+    for col in DEFAULT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    df = df[DEFAULT_COLUMNS]
+
     st.success(f"완료: {len(df)}개 행 생성")
-    st.dataframe(df, use_container_width=True, height=520)
+    st.dataframe(df, use_container_width=True, height=500)
 
-    ts = time.strftime("%Y%m%d_%H%M%S")
+    csv_bytes = rows_to_csv_bytes(rows)
     st.download_button(
         "CSV 다운로드",
-        data=to_csv_bytes(df),
-        file_name=f"misharp_product_db_{ts}.csv",
+        data=csv_bytes,
+        file_name="misharp_miya_db.csv",
         mime="text/csv",
         use_container_width=True,
-    )
-
-with st.expander("출력 컬럼 보기"):
-    st.code(", ".join(SCHEMA_COLUMNS))
-
-with st.expander("사용 팁"):
-    st.markdown(
-        """
-1. 상품 URL과 카테고리 URL을 섞어서 넣어도 됩니다.  
-2. 카테고리 URL은 내부 상품 링크를 자동으로 수집합니다.  
-3. AI 정규화 ON이면 fit_type, style_tags, 체형/커버 포인트가 더 정교해집니다.  
-4. 첫 DB는 카테고리별 30~50개씩 나눠서 구축하는 방식이 가장 안정적입니다.
-        """
     )
