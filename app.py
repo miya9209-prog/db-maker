@@ -21,7 +21,8 @@ BASE_URL = "https://www.misharp.co.kr"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 DB_COLUMNS = [
     "product_no", "product_name", "category", "sub_category", "price", "fabric",
-    "fit_type", "size_range", "recommended_body_type", "body_cover_features", "style_tags",
+    "fit_type", "size_range", "shoulder", "chest", "length", "sleeve",
+    "size_source", "measurement_source", "recommended_body_type", "body_cover_features", "style_tags",
     "season", "length_type", "sleeve_type", "color_options", "recommended_age",
     "coordination_items", "product_summary"
 ]
@@ -333,20 +334,68 @@ def infer_fabric(text: str) -> str:
     return " / ".join(found[:4]) if found else ""
 
 
-def infer_size_range(text: str) -> str:
+def extract_size_context(text: str) -> str:
     t = clean_text(text)
-    ordered = ["44", "55", "55반", "66", "66반", "77", "77반", "88", "FREE", "F"]
-    tokens = [tok for tok in ordered if tok in t]
-    if "FREE" in tokens or "F" in tokens:
-        return "FREE"
-    if len(tokens) >= 2:
-        return f"{tokens[0]}-{tokens[-1]}"
-    if len(tokens) == 1:
-        return tokens[0]
-    m = re.search(r"(\d{2}\s*~\s*\d{2})", t)
+    if not t:
+        return ""
+    chunks = []
+    for seg in re.split(r"(?<=다)\s+|(?<=[.!?])\s+|\n+", t):
+        s = clean_text(seg)
+        if not s:
+            continue
+        low = s.lower()
+        if any(k in low for k in ["사이즈", "size", "추천", "free", "프리", "44", "55", "66", "77", "88", "99", "l(", "xl(", "m(", "s("]):
+            chunks.append(s)
+    return " ".join(uniq_keep_order(chunks))[:4000]
+
+
+def infer_size_range(text: str) -> tuple[str, str]:
+    t = extract_size_context(text)
+    if not t:
+        return "", ""
+
+    ranges = re.findall(r"(44|55반|55|66반|66|77반|77|88|99)\s*[-~]\s*(44|55반|55|66반|66|77반|77|88|99)", t)
+    if ranges:
+        ordered = ["44", "55", "55반", "66", "66반", "77", "77반", "88", "99"]
+        pos = {k: i for i, k in enumerate(ordered)}
+        mins = sorted(ranges, key=lambda x: pos[x[0]])
+        maxs = sorted(ranges, key=lambda x: pos[x[1]])
+        return f"{mins[0][0]}-{maxs[-1][1]}", "option_range"
+
+    m = re.search(r"(44|55반|55|66반|66|77반|77|88|99)\s*까지\s*(?:추천|착용|가능)?", t)
     if m:
-        return clean_text(m.group(1)).replace(" ~ ", "-")
-    return ""
+        return f"55-{m.group(1)}", "recommend_text"
+
+    singles = []
+    for tok in ["44", "55", "55반", "66", "66반", "77", "77반", "88", "99"]:
+        if re.search(rf"(?<!\d){re.escape(tok)}(?!\d)", t):
+            singles.append(tok)
+    if len(singles) >= 2:
+        return f"{singles[0]}-{singles[-1]}", "single_sizes"
+
+    if re.search(r"\bFREE\b|\bF\b|프리사이즈|FREE사이즈|F사이즈", t, re.I):
+        return "55-66", "free_default"
+
+    return "", ""
+
+
+def extract_measurements(text: str) -> tuple[dict, str]:
+    t = clean_text(text)
+    pats = {
+        "shoulder": [r"어깨", r"shoulder"],
+        "chest": [r"가슴단면", r"가슴", r"chest", r"품"],
+        "length": [r"총장", r"기장", r"length"],
+        "sleeve": [r"소매장", r"소매", r"sleeve"],
+    }
+    out = {"shoulder": "", "chest": "", "length": "", "sleeve": ""}
+    for key, kws in pats.items():
+        for kw in kws:
+            m = re.search(rf"(?:{kw})\s*[:：-]?\s*(\d{{1,3}}(?:\.\d)?)", t, flags=re.I)
+            if m:
+                out[key] = clean_text(m.group(1))
+                break
+    source = "text" if any(out.values()) else ""
+    return out, source
 
 
 def infer_fit_type(text: str) -> str:
@@ -510,7 +559,8 @@ def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "
 
     category, sub_category = infer_category_from_name(name)
     fabric = infer_fabric(full_text)
-    size_range = infer_size_range(full_text)
+    size_range, size_source = infer_size_range(full_text)
+    measurements, measurement_source = extract_measurements(full_text)
     fit_type = infer_fit_type(full_text)
     recommended_body_type = infer_recommended_body_type(name, full_text)
     body_cover_features = infer_body_cover(full_text, name)
@@ -537,7 +587,13 @@ def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "
         "price": price,
         "fabric": fabric,
         "fit_type": fit_type,
-        "size_range": size_range or "FREE",
+        "size_range": size_range or "",
+        "shoulder": measurements["shoulder"],
+        "chest": measurements["chest"],
+        "length": measurements["length"],
+        "sleeve": measurements["sleeve"],
+        "size_source": size_source,
+        "measurement_source": measurement_source,
         "recommended_body_type": recommended_body_type,
         "body_cover_features": body_cover_features,
         "style_tags": style_tags,
@@ -682,7 +738,7 @@ def analyze_urls(input_text: str, use_openai: bool, delay_sec: float, max_produc
 
 
 st.title("미샵 상품 DB 생성기")
-st.caption("상품 URL 또는 카테고리 URL을 넣으면 미야언니용 DB CSV를 생성합니다. 최종 CSV 컬럼은 product_summary로 끝납니다.")
+st.caption("상품 URL 또는 카테고리 URL을 넣으면 미야언니용 DB CSV를 생성합니다. 사이즈 범위와 실측은 분리해서 저장합니다.")
 
 with st.sidebar:
     st.subheader("설정")
