@@ -19,13 +19,17 @@ st.set_page_config(page_title="미샵 DB 생성기", layout="wide")
 
 BASE_URL = "https://www.misharp.co.kr"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-DB_COLUMNS = [
-    "product_no", "product_name", "category", "sub_category", "price", "fabric",
-    "fit_type", "size_range", "shoulder", "chest", "length", "sleeve",
-    "size_source", "measurement_source", "recommended_body_type", "body_cover_features", "style_tags",
+BASE_COLUMNS = [
+    "product_no", "product_url", "product_name", "category", "sub_category", "price", "fabric",
+    "fit_type", "size_range", "recommended_body_type", "body_cover_features", "style_tags",
     "season", "length_type", "sleeve_type", "color_options", "recommended_age",
     "coordination_items", "product_summary"
 ]
+MEASUREMENT_COLUMNS = [
+    "shoulder", "chest", "chest_measure_type", "armhole", "sleeve", "sleeve_circumference",
+    "length", "length_front", "length_back", "measurement_source", "raw_measurements"
+]
+DB_COLUMNS = BASE_COLUMNS + MEASUREMENT_COLUMNS
 
 EXCLUDED_URL_KEYWORDS = [
     "cate_no=", "/product/list", "/category/", "/board/", "/article/", "/member/",
@@ -95,7 +99,7 @@ def is_product_url(url: str) -> bool:
 
 def is_category_url(url: str) -> bool:
     url = (url or "").lower()
-    return (("/product/list.html" in url and "cate_no=" in url) or "/category/" in url) and not is_product_url(url)
+    return ((("/product/list.html" in url and "cate_no=" in url) or "/category/" in url) and not is_product_url(url))
 
 
 def build_page_url(category_url: str, page: int) -> str:
@@ -129,8 +133,6 @@ def extract_total_count(html_text: str) -> int | None:
 def parse_product_cards_from_category_html(category_url: str, html_text: str) -> list[dict]:
     soup = BeautifulSoup(html_text, "html.parser")
     records = []
-
-    # Cafe24 상품 카드 우선 선택
     candidates = soup.select("li[id^='anchorBoxId_']")
     if not candidates:
         candidates = soup.select("ul.prdList > li, .xans-product-listnormal li, .prdList li")
@@ -156,7 +158,6 @@ def parse_product_cards_from_category_html(category_url: str, html_text: str) ->
                 break
 
         if not pno:
-            # 카드 HTML에서 직접 추출
             m = re.search(r"product_no=(\d+)", li_html)
             if m:
                 pno = m.group(1)
@@ -166,13 +167,11 @@ def parse_product_cards_from_category_html(category_url: str, html_text: str) ->
             continue
 
         text = clean_text(li.get_text(" ", strip=True))
-        # 상품명: 상품명 : ... 우선
         name = ""
         m = re.search(r"상품명\s*[:：]\s*(.*?)(?:상품 요약설명|판매가|할인판매가|$)", text)
         if m:
             name = clean_text(m.group(1))
         if not name:
-            # 상세 링크 텍스트 중 가장 긴 한글 텍스트 사용
             texts = [clean_text(a.get_text(" ", strip=True)) for a in li.select("a")]
             texts = [x for x in texts if len(x) >= 4 and not re.fullmatch(r"자세히|장바구니 담기|관심상품 등록 전|할인기간|닫기", x)]
             if texts:
@@ -200,25 +199,6 @@ def parse_product_cards_from_category_html(category_url: str, html_text: str) ->
             "card_summary": summary,
         })
 
-    # 백업: 카드 셀렉터 실패 시 raw regex 기반 추출
-    if not records:
-        raw_blocks = re.findall(r"상품명\s*[:：]\s*(.*?)((?:판매가|할인판매가).*?)(?=상품명\s*[:：]|$)", clean_text(html_text))
-        for idx, (name, rest) in enumerate(raw_blocks, start=1):
-            m = re.search(r"product_no=(\d+)", html_text)
-            pno = m.group(1) if m else f"regex_{idx}"
-            price = ""
-            m2 = re.search(r"할인판매가\s*[:：]\s*([0-9,]+)원", rest)
-            if m2:
-                price = m2.group(1).replace(",", "")
-            records.append({
-                "product_no": pno,
-                "product_url": f"{BASE_URL}/product/detail.html?product_no={pno}" if pno.isdigit() else "",
-                "card_name": clean_text(name),
-                "card_price": price,
-                "card_summary": "",
-            })
-
-    # 유효성 필터
     cleaned = []
     seen = set()
     for r in records:
@@ -238,7 +218,6 @@ def parse_product_cards_from_category_html(category_url: str, html_text: str) ->
 def collect_product_cards_from_category(category_url: str, max_products: int = 500, delay_sec: float = 0.2) -> tuple[list[dict], int | None]:
     first_html = fetch_html_cached(category_url)
     total_count = extract_total_count(first_html)
-
     all_cards = []
     seen = set()
     page = 1
@@ -268,7 +247,6 @@ def collect_product_cards_from_category(category_url: str, max_products: int = 5
             empty_streak += 1
         else:
             empty_streak = 0
-
         if total_count and len(all_cards) >= total_count:
             break
         if empty_streak >= 2:
@@ -279,14 +257,6 @@ def collect_product_cards_from_category(category_url: str, max_products: int = 5
             time.sleep(delay_sec)
 
     return all_cards, total_count
-
-
-def parse_price(text: str) -> str:
-    text = clean_text(text)
-    m = re.search(r"([0-9][0-9,]{2,})\s*원", text)
-    if m:
-        return m.group(1).replace(",", "")
-    return ""
 
 
 def normalize_name(name: str) -> str:
@@ -334,70 +304,6 @@ def infer_fabric(text: str) -> str:
     return " / ".join(found[:4]) if found else ""
 
 
-def extract_size_context(text: str) -> str:
-    t = clean_text(text)
-    if not t:
-        return ""
-    chunks = []
-    for seg in re.split(r"(?<=다)\s+|(?<=[.!?])\s+|\n+", t):
-        s = clean_text(seg)
-        if not s:
-            continue
-        low = s.lower()
-        if any(k in low for k in ["사이즈", "size", "추천", "free", "프리", "44", "55", "66", "77", "88", "99", "l(", "xl(", "m(", "s("]):
-            chunks.append(s)
-    return " ".join(uniq_keep_order(chunks))[:4000]
-
-
-def infer_size_range(text: str) -> tuple[str, str]:
-    t = extract_size_context(text)
-    if not t:
-        return "", ""
-
-    ranges = re.findall(r"(44|55반|55|66반|66|77반|77|88|99)\s*[-~]\s*(44|55반|55|66반|66|77반|77|88|99)", t)
-    if ranges:
-        ordered = ["44", "55", "55반", "66", "66반", "77", "77반", "88", "99"]
-        pos = {k: i for i, k in enumerate(ordered)}
-        mins = sorted(ranges, key=lambda x: pos[x[0]])
-        maxs = sorted(ranges, key=lambda x: pos[x[1]])
-        return f"{mins[0][0]}-{maxs[-1][1]}", "option_range"
-
-    m = re.search(r"(44|55반|55|66반|66|77반|77|88|99)\s*까지\s*(?:추천|착용|가능)?", t)
-    if m:
-        return f"55-{m.group(1)}", "recommend_text"
-
-    singles = []
-    for tok in ["44", "55", "55반", "66", "66반", "77", "77반", "88", "99"]:
-        if re.search(rf"(?<!\d){re.escape(tok)}(?!\d)", t):
-            singles.append(tok)
-    if len(singles) >= 2:
-        return f"{singles[0]}-{singles[-1]}", "single_sizes"
-
-    if re.search(r"\bFREE\b|\bF\b|프리사이즈|FREE사이즈|F사이즈", t, re.I):
-        return "55-66", "free_default"
-
-    return "", ""
-
-
-def extract_measurements(text: str) -> tuple[dict, str]:
-    t = clean_text(text)
-    pats = {
-        "shoulder": [r"어깨", r"shoulder"],
-        "chest": [r"가슴단면", r"가슴", r"chest", r"품"],
-        "length": [r"총장", r"기장", r"length"],
-        "sleeve": [r"소매장", r"소매", r"sleeve"],
-    }
-    out = {"shoulder": "", "chest": "", "length": "", "sleeve": ""}
-    for key, kws in pats.items():
-        for kw in kws:
-            m = re.search(rf"(?:{kw})\s*[:：-]?\s*(\d{{1,3}}(?:\.\d)?)", t, flags=re.I)
-            if m:
-                out[key] = clean_text(m.group(1))
-                break
-    source = "text" if any(out.values()) else ""
-    return out, source
-
-
 def infer_fit_type(text: str) -> str:
     t = clean_text(text)
     rules = [
@@ -406,6 +312,7 @@ def infer_fit_type(text: str) -> str:
         ("세미루즈", ["세미루즈", "여유 있는 핏", "살짝 여유"]),
         ("슬림핏", ["슬림핏"]),
         ("정핏", ["정핏", "단정한 핏", "기본 핏"]),
+        ("A라인", ["A라인", "A LINE"]),
     ]
     for val, keys in rules:
         if any(k in t for k in keys):
@@ -526,7 +433,214 @@ def extract_detail_text_blocks(soup: BeautifulSoup) -> str:
                 txt = clean_text(node.get_text(" ", strip=True))
             if txt:
                 blocks.append(txt)
-    return "\n".join(uniq_keep_order(blocks))[:12000]
+    return "\n".join(uniq_keep_order(blocks))[:20000]
+
+
+def extract_size_context(soup: BeautifulSoup, full_text: str) -> str:
+    blocks = []
+    for sel in [".infoArea", ".xans-product-detaildesign", ".detailArea", "#prdDetail", ".ec-base-table", "table"]:
+        for node in soup.select(sel):
+            txt = clean_text(node.get_text(" ", strip=True))
+            if any(k.lower() in txt.lower() for k in ["사이즈", "추천", "free", "프리", "55", "66", "77", "88", "xl", "l(", "xl("]):
+                blocks.append(txt)
+    if not blocks:
+        blocks.append(full_text)
+    return " ".join(uniq_keep_order(blocks))[:12000]
+
+
+def infer_size_range(text: str) -> tuple[str, str]:
+    t = clean_text(text)
+    if not t:
+        return "", ""
+
+    ranges = re.findall(r"(44|55반|55|66반|66|77반|77|88|99)\s*[-~]\s*(44|55반|55|66반|66|77반|77|88|99)", t)
+    if ranges:
+        order = {"44":1,"55":2,"55반":3,"66":4,"66반":5,"77":6,"77반":7,"88":8,"99":9}
+        mins = sorted(ranges, key=lambda x: order.get(x[0], 999))[0][0]
+        maxs = sorted(ranges, key=lambda x: order.get(x[1], -1))[-1][1]
+        return f"{mins}-{maxs}", "option_range"
+
+    m = re.search(r"(44|55반|55|66반|66|77반|77|88|99)\s*까지\s*(?:추천|착용|가능)?", t)
+    if m:
+        return f"55-{m.group(1)}", "recommend_text"
+
+    singles = re.findall(r"(?<!\d)(44|55반|55|66반|66|77반|77|88|99)(?!\d)", t)
+    if len(singles) >= 2:
+        uniq = []
+        for s in singles:
+            if s not in uniq:
+                uniq.append(s)
+        return f"{uniq[0]}-{uniq[-1]}", "size_tokens"
+
+    if re.search(r"\bFREE\b|프리사이즈|FREE사이즈|F사이즈|\bF\b", t, re.I):
+        return "55-66", "free_default"
+
+    return "", ""
+
+
+def _extract_number(text: str) -> str:
+    m = re.search(r"(-?\d+(?:\.\d+)?)", clean_text(text))
+    return m.group(1) if m else ""
+
+
+def _normalize_measure_header(header: str) -> str:
+    h = clean_text(header).replace(" ", "")
+    if not h:
+        return ""
+    if "어깨" in h:
+        return "shoulder"
+    if "가슴" in h and "둘레" in h:
+        return "chest_circumference"
+    if "가슴" in h:
+        return "chest"
+    if "암홀" in h:
+        return "armhole"
+    if "소매" in h and "둘레" in h:
+        return "sleeve_circumference"
+    if "소매" in h:
+        return "sleeve"
+    if ("총장" in h or "기장" in h) and "앞" in h:
+        return "length_front"
+    if ("총장" in h or "기장" in h) and "뒤" in h:
+        return "length_back"
+    if "총장" in h or "기장" in h:
+        return "length"
+    return ""
+
+
+def _measurement_payload():
+    return {
+        "shoulder": "",
+        "chest": "",
+        "chest_measure_type": "",
+        "armhole": "",
+        "sleeve": "",
+        "sleeve_circumference": "",
+        "length": "",
+        "length_front": "",
+        "length_back": "",
+        "measurement_source": "",
+        "raw_measurements": "",
+    }
+
+
+def _apply_measure_value(payload: dict, key: str, raw_value: str):
+    value = _extract_number(raw_value)
+    if not value:
+        return
+    if key == "chest_circumference":
+        payload["raw_measurements"] = payload.get("raw_measurements", "")
+        payload["chest_measure_type"] = "circumference"
+        try:
+            f = float(value)
+            payload["chest"] = str(int(f / 2)) if float(f / 2).is_integer() else f"{f/2:.1f}"
+        except Exception:
+            payload["chest"] = value
+        return
+    payload[key] = value
+
+
+def parse_measurement_tables(soup: BeautifulSoup) -> dict:
+    payload = _measurement_payload()
+    raw_pairs = []
+    found = False
+
+    for table in soup.select("table"):
+        rows = []
+        for tr in table.select("tr"):
+            cells = [clean_text(c.get_text(" ", strip=True)) for c in tr.select("th,td")]
+            cells = [c for c in cells if c]
+            if cells:
+                rows.append(cells)
+        if not rows:
+            continue
+
+        flat = " ".join([" ".join(r) for r in rows])
+        if not any(k in flat for k in ["어깨", "가슴", "암홀", "소매", "총장", "기장"]):
+            continue
+
+        # case 1: horizontal table headers + values
+        if len(rows) >= 2:
+            headers = rows[0]
+            values = rows[1]
+            if len(headers) == len(values) and len(headers) >= 2:
+                local_hits = 0
+                for h, v in zip(headers, values):
+                    key = _normalize_measure_header(h)
+                    if key:
+                        _apply_measure_value(payload, key, v)
+                        raw_pairs.append({clean_text(h): _extract_number(v)})
+                        local_hits += 1
+                if local_hits >= 2:
+                    found = True
+
+        # case 2: vertical th-td pairs
+        for row in rows:
+            if len(row) >= 2:
+                key = _normalize_measure_header(row[0])
+                if key:
+                    _apply_measure_value(payload, key, row[1])
+                    raw_pairs.append({clean_text(row[0]): _extract_number(row[1])})
+                    found = True
+
+    if payload["length"] == "":
+        vals = [v for v in [payload["length_front"], payload["length_back"]] if v]
+        if vals:
+            try:
+                payload["length"] = str(max(float(v) for v in vals)).rstrip('0').rstrip('.')
+            except Exception:
+                payload["length"] = vals[-1]
+
+    if found:
+        payload["measurement_source"] = "table"
+        payload["raw_measurements"] = json.dumps(raw_pairs, ensure_ascii=False)
+    return payload
+
+
+def parse_measurements_from_text(full_text: str) -> dict:
+    payload = _measurement_payload()
+    patterns = {
+        "shoulder": [r"어깨단면", r"어깨"],
+        "chest": [r"가슴단면", r"가슴"],
+        "armhole": [r"암홀둘레", r"암홀"],
+        "sleeve": [r"소매길이", r"소매장", r"소매"],
+        "sleeve_circumference": [r"소매둘레"],
+        "length_front": [r"총장\(앞\)", r"앞총장"],
+        "length_back": [r"총장\(뒤\)", r"뒤총장"],
+        "length": [r"총장", r"기장"],
+    }
+    raw_pairs = []
+    for field, keys in patterns.items():
+        for key in keys:
+            m = re.search(rf"(?:{key})\s*[:：]?\s*(-?\d+(?:\.\d+)?)", full_text)
+            if m:
+                payload[field] = m.group(1)
+                raw_pairs.append({key: m.group(1)})
+                break
+
+    m = re.search(r"가슴둘레\s*[:：]?\s*(-?\d+(?:\.\d+)?)", full_text)
+    if m and not payload["chest"]:
+        raw_val = m.group(1)
+        payload["chest_measure_type"] = "circumference"
+        try:
+            f = float(raw_val)
+            payload["chest"] = str(int(f / 2)) if float(f / 2).is_integer() else f"{f/2:.1f}"
+        except Exception:
+            payload["chest"] = raw_val
+        raw_pairs.append({"가슴둘레": raw_val})
+
+    if payload["length"] == "":
+        vals = [v for v in [payload["length_front"], payload["length_back"]] if v]
+        if vals:
+            try:
+                payload["length"] = str(max(float(v) for v in vals)).rstrip('0').rstrip('.')
+            except Exception:
+                payload["length"] = vals[-1]
+
+    if any(payload[k] for k in ["shoulder", "chest", "armhole", "sleeve", "sleeve_circumference", "length", "length_front", "length_back"]):
+        payload["measurement_source"] = "text"
+        payload["raw_measurements"] = json.dumps(raw_pairs, ensure_ascii=False)
+    return payload
 
 
 def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "", fallback_summary: str = "") -> dict:
@@ -559,8 +673,7 @@ def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "
 
     category, sub_category = infer_category_from_name(name)
     fabric = infer_fabric(full_text)
-    size_range, size_source = infer_size_range(full_text)
-    measurements, measurement_source = extract_measurements(full_text)
+    size_range, size_source = infer_size_range(extract_size_context(soup, full_text))
     fit_type = infer_fit_type(full_text)
     recommended_body_type = infer_recommended_body_type(name, full_text)
     body_cover_features = infer_body_cover(full_text, name)
@@ -571,16 +684,19 @@ def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "
     color_options = infer_color_options(full_text, name)
     coordination_items = infer_coordination_items(name, full_text)
 
+    measurements = parse_measurement_tables(soup)
+    if not measurements.get("measurement_source"):
+        measurements = parse_measurements_from_text(full_text)
+
     summary_src = fallback_summary or full_text
     summary_clean = clean_text(summary_src)
     summary_clean = re.sub(r"^.*?상품 요약설명\s*[:：]?", "", summary_clean)
     summary_clean = re.sub(r"(최근 본 상품|전체상품목록 바로가기|본문 바로가기|LOGIN|JOIN|MYPAGE|CART|ABOUT|SHOP).*$", "", summary_clean)
-    product_summary = clean_text(summary_clean)[:220]
-    if not product_summary:
-        product_summary = clean_text(name)[:220]
+    product_summary = clean_text(summary_clean)[:220] or clean_text(name)[:220]
 
     return {
         "product_no": extract_product_no(url),
+        "product_url": normalize_product_url(url),
         "product_name": name,
         "category": category,
         "sub_category": sub_category,
@@ -588,12 +704,6 @@ def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "
         "fabric": fabric,
         "fit_type": fit_type,
         "size_range": size_range or "",
-        "shoulder": measurements["shoulder"],
-        "chest": measurements["chest"],
-        "length": measurements["length"],
-        "sleeve": measurements["sleeve"],
-        "size_source": size_source,
-        "measurement_source": measurement_source,
         "recommended_body_type": recommended_body_type,
         "body_cover_features": body_cover_features,
         "style_tags": style_tags,
@@ -604,6 +714,8 @@ def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "
         "recommended_age": "4050",
         "coordination_items": coordination_items,
         "product_summary": product_summary,
+        **measurements,
+        "_size_source": size_source,
     }
 
 
@@ -611,20 +723,20 @@ def normalize_with_openai(row: dict) -> dict:
     client = get_client()
     if client is None:
         return row
-
+    normalize_cols = BASE_COLUMNS
     prompt = f"""
 다음 미샵 상품 정보를 미야언니 DB 형식으로 표준화하세요.
 반드시 아래 키만 JSON으로 반환하세요.
 키 순서:
-{DB_COLUMNS}
+{normalize_cols}
 규칙:
 - 출력은 한국어
 - style_tags, body_cover_features, coordination_items, season은 세미콜론(;)으로 구분
 - product_summary는 120자 내외
 - 빈 값은 추론하되 과장 금지
-- 마지막 컬럼은 반드시 product_summary 까지이며 다른 컬럼 추가 금지
+- 제공된 product_no, product_url, product_name, price는 바꾸지 말 것
 입력 데이터:
-{json.dumps(row, ensure_ascii=False)}
+{json.dumps({k: row.get(k, '') for k in DB_COLUMNS}, ensure_ascii=False)}
 """
     try:
         resp = client.chat.completions.create(
@@ -640,7 +752,9 @@ def normalize_with_openai(row: dict) -> dict:
         if not m:
             return row
         data = json.loads(m.group(0))
-        out = {col: clean_text(data.get(col, row.get(col, ""))) for col in DB_COLUMNS}
+        out = row.copy()
+        for col in normalize_cols:
+            out[col] = clean_text(data.get(col, row.get(col, "")))
         return out
     except Exception:
         return row
@@ -695,7 +809,6 @@ def analyze_urls(input_text: str, use_openai: bool, delay_sec: float, max_produc
                 "collected_products": 1,
             })
 
-    # 중복 제거
     dedup_targets = []
     seen = set()
     for t in product_targets:
@@ -738,7 +851,7 @@ def analyze_urls(input_text: str, use_openai: bool, delay_sec: float, max_produc
 
 
 st.title("미샵 상품 DB 생성기")
-st.caption("상품 URL 또는 카테고리 URL을 넣으면 미야언니용 DB CSV를 생성합니다. 사이즈 범위와 실측은 분리해서 저장합니다.")
+st.caption("상품 URL 또는 카테고리 URL을 넣으면 미야언니용 DB CSV를 생성합니다. 실측 표(어깨/가슴/소매/총장) 파싱을 우선 시도합니다.")
 
 with st.sidebar:
     st.subheader("설정")
@@ -746,8 +859,8 @@ with st.sidebar:
     max_products = st.number_input("카테고리 최대 수집 상품 수", min_value=1, max_value=2000, value=500, step=50)
     delay_sec = st.slider("요청 간 딜레이(초)", min_value=0.0, max_value=2.0, value=0.2, step=0.1)
     st.markdown("- 카테고리에서는 **상품 카드만** 수집합니다.")
-    st.markdown("- 최종 CSV는 미야언니 DB 형식에 맞춰 **product_summary**로 끝납니다.")
-    st.markdown("- 소스 URL 확인이 필요하면 아래 audit CSV를 같이 내려받으세요.")
+    st.markdown("- 실측은 **HTML 테이블 우선 / 텍스트 보조** 방식으로 추출합니다.")
+    st.markdown("- 가슴둘레가 있는 경우 chest 컬럼에는 단면 환산값(둘레÷2)을 저장합니다.")
 
 input_text = st.text_area(
     "상품 URL / 카테고리 URL 입력",
@@ -784,7 +897,7 @@ if preview_only and input_text.strip():
                 "product_url": normalize_product_url(u),
             })
     if preview_rows:
-        st.dataframe(pd.DataFrame(preview_rows))
+        st.dataframe(pd.DataFrame(preview_rows), use_container_width=True)
 
 if run and input_text.strip():
     try:
