@@ -304,21 +304,76 @@ def infer_fabric(text: str) -> str:
     return " / ".join(found[:4]) if found else ""
 
 
-def infer_fit_type(text: str) -> str:
-    t = clean_text(text)
-    rules = [
-        ("오버핏", ["오버핏"]),
-        ("루즈핏", ["루즈핏"]),
-        ("세미루즈", ["세미루즈", "여유 있는 핏", "살짝 여유"]),
-        ("슬림핏", ["슬림핏"]),
-        ("정핏", ["정핏", "단정한 핏", "기본 핏"]),
-        ("A라인", ["A라인", "A LINE"]),
-    ]
-    for val, keys in rules:
-        if any(k in t for k in keys):
-            return val
-    return ""
+def infer_fit_type(text: str, category: str = "", sub_category: str = "") -> str:
+    """상품명/상세설명에서 실제 핏 키워드를 추출합니다.
 
+    기존처럼 정핏/세미루즈/루즈핏/오버핏 같은 상의 중심 핏만 넣지 않고,
+    하의 실루엣(와이드/일자/부츠컷/배기/조거 등), 스커트·원피스 라인(A라인/H라인/플레어),
+    어깨·소매 핏(레글런/드롭숄더/퍼프/벌룬 등)도 세미콜론(;) 태그로 함께 저장합니다.
+    픽톡 추천에서는 "일자", "와이드", "레글런"처럼 contains 검색으로 필터링할 수 있습니다.
+    """
+    t = clean_text(text)
+    cat = clean_text(category)
+    sub = clean_text(sub_category)
+    out = []
+
+    def add(label: str, keys: list[str]):
+        if label not in out and any(k.lower() in t.lower() for k in keys):
+            out.append(label)
+
+    # 하의 전용: 고객이 실제로 요청하는 팬츠 핏을 우선 추출
+    if cat == "팬츠" or sub in ["팬츠", "슬랙스", "데님"]:
+        add("세미와이드핏", ["세미 와이드", "세미와이드"])
+        add("와이드핏", ["와이드", "통팬츠"])
+        add("세미부츠컷", ["세미 부츠컷", "세미부츠컷"])
+        add("부츠컷", ["부츠컷"])
+        add("일자핏", ["일자", "스트레이트", "straight"])
+        add("배기핏", ["배기", "배기핏"])
+        add("조거핏", ["조거", "죠거"])
+        add("테이퍼드핏", ["테이퍼드", "배럴", "barrel"])
+        add("슬림핏", ["슬림", "슬림핏"])
+        add("스키니핏", ["스키니"])
+        add("루즈핏", ["루즈", "루즈핏", "낙낙"])
+        add("밴딩핏", ["밴딩", "이밴드", "허리 밴드"])
+        add("핀턱핏", ["핀턱", "턱 팬츠", "턱팬츠"])
+
+    # 원피스/스커트 라인
+    if cat == "원피스/스커트" or sub in ["원피스", "스커트"]:
+        add("A라인", ["a라인", "a line", "에이라인"])
+        add("H라인", ["h라인", "h line", "에이치라인"])
+        add("플레어핏", ["플레어", "훌", "훌스커트"])
+        add("머메이드핏", ["머메이드"])
+        add("랩핏", ["랩스커트", "랩 원피스", "랩원피스", "랩 스타일"])
+        add("슬림핏", ["슬림", "슬림핏"])
+        add("루즈핏", ["루즈", "루즈핏", "낙낙"])
+
+    # 상의/아우터 공통 전체 핏
+    add("오버핏", ["오버핏", "오버 핏"])
+    add("루즈핏", ["루즈핏", "루즈 핏", "낙낙한 핏", "넉넉한 핏"])
+    add("세미루즈", ["세미루즈", "세미 루즈", "여유 있는 핏", "여유있는 핏", "살짝 여유", "적당히 여유"])
+    add("슬림핏", ["슬림핏", "슬림한 핏", "슬림하게"])
+    add("정핏", ["정핏", "정 사이즈 핏", "단정한 핏", "기본 핏", "레귤러핏", "레귤러 핏"])
+
+    # 어깨/암홀/소매 실루엣도 fit_type에 함께 저장
+    add("레글런핏", ["레글런", "래글런", "raglan"])
+    add("드롭숄더", ["드롭숄더", "드롭 숄더", "어깨가 드롭"])
+    add("퍼프소매", ["퍼프", "퍼프소매", "퍼프 소매"])
+    add("벌룬소매", ["벌룬", "벌룬소매", "볼륨소매", "볼륨 소매"])
+    add("플레어소매", ["플레어 소매", "나팔소매", "나팔 소매"])
+    add("캡소매", ["캡소매", "캡 소매"])
+    add("민소매핏", ["민소매", "나시", "슬리브리스"])
+
+    # 텍스트에 명시된 핏이 없을 때만 최소 기본값 보정
+    if not out:
+        # 카테고리 수집 오류가 있을 수 있으므로 상품명에 다른 품목명이 명확하면 기본핏을 억지 입력하지 않습니다.
+        non_pants_keys = ["셔츠", "티셔츠", "블라우스", "가디건", "니트", "자켓", "점퍼", "코트", "가방", "원피스", "스커트"]
+        is_non_pants_name = any(k in t for k in non_pants_keys)
+        if cat == "팬츠" and not is_non_pants_name:
+            return "팬츠기본핏"
+        if cat == "원피스/스커트" and not any(k in t for k in ["팬츠", "슬랙스", "바지"]):
+            return "기본라인"
+        return ""
+    return ";".join(out[:8])
 
 def infer_style_tags(text: str, name: str) -> str:
     t = f"{name} {text}"
@@ -360,15 +415,31 @@ def infer_length_type(name: str, text: str) -> str:
     return "기본"
 
 
-def infer_sleeve_type(name: str, text: str) -> str:
+def infer_sleeve_type(name: str, text: str, category: str = "") -> str:
     t = f"{name} {text}"
+    if category in ["팬츠", "원피스/스커트"] and "원피스" not in t:
+        return "없음"
+    if any(k in t for k in ["민소매", "나시", "슬리브리스"]):
+        return "민소매"
+    if any(k in t for k in ["캡소매", "캡 소매"]):
+        return "캡소매"
     if "반팔" in t:
         return "반팔"
-    if "퍼프" in t:
+    if any(k in t for k in ["7부", "칠부"]):
+        return "7부소매"
+    if any(k in t for k in ["5부", "오부"]):
+        return "5부소매"
+    if any(k in t for k in ["퍼프", "퍼프소매"]):
         return "퍼프소매"
-    if "드롭숄더" in t:
+    if any(k in t for k in ["벌룬", "볼륨소매", "벌룬소매"]):
+        return "벌룬소매"
+    if any(k in t for k in ["레글런", "래글런"]):
+        return "레글런소매"
+    if "드롭숄더" in t or "드롭 숄더" in t:
         return "드롭숄더"
-    return "긴팔"
+    if any(k in t for k in ["긴팔", "롱슬리브", "소매"]):
+        return "긴팔"
+    return ""
 
 
 def infer_color_options(text: str, name: str) -> str:
@@ -674,13 +745,13 @@ def parse_detail_page(url: str, fallback_name: str = "", fallback_price: str = "
     category, sub_category = infer_category_from_name(name)
     fabric = infer_fabric(full_text)
     size_range, size_source = infer_size_range(extract_size_context(soup, full_text))
-    fit_type = infer_fit_type(full_text)
+    fit_type = infer_fit_type(f"{name} {full_text}", category, sub_category)
     recommended_body_type = infer_recommended_body_type(name, full_text)
     body_cover_features = infer_body_cover(full_text, name)
     style_tags = infer_style_tags(full_text, name)
     season = infer_season(full_text, name)
     length_type = infer_length_type(name, full_text)
-    sleeve_type = infer_sleeve_type(name, full_text)
+    sleeve_type = infer_sleeve_type(name, full_text, category)
     color_options = infer_color_options(full_text, name)
     coordination_items = infer_coordination_items(name, full_text)
 
